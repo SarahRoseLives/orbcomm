@@ -1,0 +1,7 @@
+*.wav
+__pycache__/
+*.pyc
+Orbcomm.gpr
+Orbcomm.lock
+Orbcomm.lock~
+Orbcomm.rep/
