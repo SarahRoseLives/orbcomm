@@ -65,8 +65,8 @@ SPS           = AUDIO_RATE // BIT_RATE  # 10 samples per bit
 # HackRF transmit sample rate
 TX_RATE       = 2e6          # 2 Msps IQ
 
-# FM deviation for narrowband FM (~2.5 kHz deviation in 12.5 kHz channels)
-FM_DEVIATION  = 2500.0       # Hz peak deviation
+# FM deviation - wider = louder on NFM receiver
+FM_DEVIATION  = 4000.0       # Hz peak deviation
 
 # Default Orbcomm downlink frequencies (MHz)
 ORBCOMM_FREQS = [
@@ -97,17 +97,35 @@ def build_packet_sequence() -> bytes:
     return packets
 
 
-def packets_to_baseband(packets: list[bytes], idle_bits: int = 32) -> np.ndarray:
+def make_test_tone(freq: float = 1000.0,
+                   duration: float = 2.0,
+                   sample_rate: float = AUDIO_RATE,
+                   amplitude: float = 8000.0) -> np.ndarray:
+    """Generate a sine wave test tone for receiver verification."""
+    t = np.arange(int(sample_rate * duration)) / sample_rate
+    return (np.sin(2.0 * math.pi * freq * t) * amplitude).astype(np.float64)
+
+
+def packets_to_baseband(packets: list[bytes],
+                        idle_bits: int = 32,
+                        preamble_tone: bool = True) -> np.ndarray:
     """
     Convert a list of packets into a continuous SDPSK baseband signal.
+    Optionally prepends a 1 kHz tone for receiver tuning verification.
     """
+    parts = []
+
+    if preamble_tone:
+        parts.append(make_test_tone(freq=1000, duration=0.5))  # shorter preamble
+        parts.append(np.zeros(int(AUDIO_RATE * 0.2), dtype=np.float64))  # 200ms gap
+
     idle_samples = [0] * (idle_bits * SPB)
     all_bits = []
     for pkt in packets:
         all_bits.extend(bits_from_bytes(pkt))
 
-    baseband = np.array(modulate_sdpsk(all_bits), dtype=np.float64)
-    return baseband
+    parts.append(np.array(modulate_sdpsk(all_bits), dtype=np.float64))
+    return np.concatenate(parts)
 
 
 # ─── FM Modulator ────────────────────────────────────────────────────────────
@@ -153,56 +171,58 @@ def transmit_hackrf(iq: np.ndarray,
                     repeat: int = 1):
     """
     Stream IQ samples to hackrf_transfer for transmission.
+    Uses a temp file to avoid Windows pipe buffer limits.
     """
     if _HACKRF_PATH is None:
         print("Error: hackrf_transfer not found.")
         print("Install hackrf-tools or set the path in the script.")
         sys.exit(1)
 
-    # Interleave I/Q as int8 for hackrf_transfer
+    # Interleave I/Q as int8
     i_scaled = (iq.real * 127).astype(np.int8)
     q_scaled = (iq.imag * 127).astype(np.int8)
     interleaved = np.empty(2 * len(iq), dtype=np.int8)
     interleaved[0::2] = i_scaled
     interleaved[1::2] = q_scaled
 
-    if repeat > 1:
-        interleaved = np.tile(interleaved, repeat)
-
-    cmd = [
-        _HACKRF_PATH,
-        "-t", "-",
-        "-f", str(int(freq_hz)),
-        "-s", str(int(tx_rate)),
-        "-x", str(gain_db),
-        "-a", "1",
-    ]
-
-    print(f"HackRF: {_HACKRF_PATH}")
-    print(f"Transmitting at {freq_hz/1e6:.4f} MHz, {tx_rate/1e6:.1f} Msps, gain={gain_db} dB")
-    print(f"Signal duration: {len(interleaved) / (2 * tx_rate):.2f}s")
-    print("Press Ctrl+C to stop.")
-
+    # Write to temp file to avoid Windows pipe limits
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(suffix=".iq", delete=False)
+    tmp_path = tmp.name
     try:
+        buf = interleaved.tobytes()
+        tmp.write(buf)
+        if repeat > 1:
+            for _ in range(repeat - 1):
+                tmp.write(buf)
+        tmp.close()
+
+        cmd = [
+            _HACKRF_PATH,
+            "-t", tmp_path,
+            "-f", str(int(freq_hz)),
+            "-s", str(int(tx_rate)),
+            "-x", str(gain_db),
+            "-a", "1",
+        ]
+
+        print(f"HackRF: {_HACKRF_PATH}")
+        print(f"Transmitting at {freq_hz/1e6:.4f} MHz, {tx_rate/1e6:.1f} Msps, gain={gain_db} dB")
+        print(f"Signal duration: {os.path.getsize(tmp_path) / (2 * tx_rate):.2f}s")
+        print("Press Ctrl+C to stop.")
+
         proc = subprocess.Popen(
             cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        stdout, stderr = proc.communicate(input=interleaved.tobytes())
-        if stderr:
-            err_text = stderr.decode(errors="replace")
-            # Filter out expected info messages
-            for line in err_text.splitlines():
-                if "error" in line.lower() or "fail" in line.lower():
-                    print(f"  hackrf: {line.strip()}")
-    except FileNotFoundError:
-        print(f"\nError: {_HACKRF_PATH} not found.")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        proc.terminate()
-        print("\nTransmission stopped.")
+        proc.wait(timeout=120)
+
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def save_iq_file(iq: np.ndarray, path: str, tx_rate: float = TX_RATE):
