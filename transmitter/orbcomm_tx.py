@@ -107,8 +107,9 @@ def make_test_tone(freq: float = 1000.0,
 
 
 def packets_to_baseband(packets: list[bytes],
-                        idle_bits: int = 32,
-                        preamble_tone: bool = True) -> np.ndarray:
+                         idle_bits: int = 32,
+                         preamble_tone: bool = True,
+                         invert: bool = False) -> np.ndarray:
     """
     Convert a list of packets into a continuous SDPSK baseband signal.
     Optionally prepends a 1 kHz tone for receiver tuning verification.
@@ -125,7 +126,12 @@ def packets_to_baseband(packets: list[bytes],
         all_bits.extend(bits_from_bytes(pkt))
 
     parts.append(np.array(modulate_sdpsk(all_bits), dtype=np.float64))
-    return np.concatenate(parts)
+    result = np.concatenate(parts)
+    
+    if invert:
+        result = -result
+    
+    return result
 
 
 # ─── FM Modulator ────────────────────────────────────────────────────────────
@@ -268,6 +274,8 @@ Examples:
                         help=f"FM deviation in Hz (default: {FM_DEVIATION})")
     parser.add_argument("--idle-bits", type=int, default=64,
                         help="Silence bits between packets (default: 64)")
+    parser.add_argument("--invert", action="store_true",
+                        help="Invert signal polarity (some receivers flip phase)")
     parser.add_argument("--list-freqs", action="store_true",
                         help="List common Orbcomm downlink frequencies")
     args = parser.parse_args()
@@ -284,7 +292,8 @@ Examples:
     for pkt in packets:
         print(f"  type=0x{pkt[0]:02X}, {pkt.hex()[:16]}...")
 
-    baseband = packets_to_baseband(packets, idle_bits=args.idle_bits)
+    baseband = packets_to_baseband(packets, idle_bits=args.idle_bits,
+                                    invert=args.invert)
     print(f"Baseband: {len(baseband)} samples at {AUDIO_RATE} Hz "
           f"({len(baseband)/AUDIO_RATE:.2f}s)")
 
