@@ -8,7 +8,7 @@ at 4800 bps -- identical to what an Orbcomm satellite broadcasts.
 
 Requirements:
     - HackRF One hardware
-    - hackrf_transfer (from hackrf-tools package)
+    - hackrf_transfer (from hackrf-tools)
     - numpy (pip install numpy)
 
 Usage:
@@ -25,6 +25,17 @@ import subprocess
 import argparse
 import math
 import os
+
+# Find hackrf_transfer
+_HACKRF_PATH = None
+for _candidate in [
+    r"C:\HackRF\bin\hackrf_transfer.exe",
+    r"C:\Program Files\HackRF\bin\hackrf_transfer.exe",
+    "hackrf_transfer",
+]:
+    if os.path.exists(_candidate) or _candidate == "hackrf_transfer":
+        _HACKRF_PATH = _candidate
+        break
 
 # Allow importing from the parent orbcomm package
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -51,11 +62,10 @@ AUDIO_RATE    = 48000       # Baseband audio sample rate (Hz)
 BIT_RATE      = 4800        # SDPSK bit rate (bps)
 SPS           = AUDIO_RATE // BIT_RATE  # 10 samples per bit
 
-# HackRF transmit sample rate -- must be one the HackRF supports.
-# Typical values: 2e6, 4e6, 8e6, 10e6, 16e6, 20e6
+# HackRF transmit sample rate
 TX_RATE       = 2e6          # 2 Msps IQ
 
-# FM deviation for narrowband FM (Orbcomm uses ~2.5 kHz deviation in 12.5 kHz channels)
+# FM deviation for narrowband FM (~2.5 kHz deviation in 12.5 kHz channels)
 FM_DEVIATION  = 2500.0       # Hz peak deviation
 
 # Default Orbcomm downlink frequencies (MHz)
@@ -65,24 +75,22 @@ ORBCOMM_FREQS = [
     137.750e6, 137.8125e6, 137.875e6, 137.9375e6,
 ]
 
+
 # ─── Packet Sequence Builder ─────────────────────────────────────────────────
 
 def build_packet_sequence() -> bytes:
     """Build a realistic sequence of Orbcomm packets."""
     packets = []
 
-    # Network announcement for a few satellites
     for sat_id in [5, 7, 12, 18, 23]:
-        freq_raw = 128 + sat_id * 3  # arbitrary channel mapping
+        freq_raw = 128 + sat_id * 3
         frame = sat_id % 15
         packets.append(build_announcement_packet(sat_id, freq_raw, frame))
 
-    # An ephemeris packet
     packets.append(build_ephemeris_packet(
         sat_id=7, ts=0x123456, lon=500000, lat=300000, alt=200000
     ))
 
-    # Some fill packets
     for _ in range(3):
         packets.append(build_fill_packet())
 
@@ -92,13 +100,6 @@ def build_packet_sequence() -> bytes:
 def packets_to_baseband(packets: list[bytes], idle_bits: int = 32) -> np.ndarray:
     """
     Convert a list of packets into a continuous SDPSK baseband signal.
-
-    Args:
-        packets: List of 24-byte Orbcomm packets
-        idle_bits: Number of zero-bits to insert between packets (padding)
-
-    Returns:
-        1D numpy float64 array of baseband samples at 48000 Hz
     """
     idle_samples = [0] * (idle_bits * SPB)
     all_bits = []
@@ -118,13 +119,9 @@ def fm_modulate(baseband: np.ndarray,
     """
     FM-modulate a baseband signal to complex IQ at the HackRF transmit rate.
 
-    Uses a polyphase resampler to go from audio_rate → tx_rate, then applies
-    FM modulation:  s(t) = exp(j * 2π * deviation ∫ m(t) dt / tx_rate)
-
     Returns:
         complex64 IQ array normalized to [-1.0, 1.0] for HackRF
     """
-    # Resample baseband from audio_rate to tx_rate
     num_samples = int(len(baseband) * tx_rate / audio_rate)
     indices = np.arange(num_samples) * audio_rate / tx_rate
     resampled = np.interp(indices, np.arange(len(baseband)), baseband)
@@ -134,16 +131,12 @@ def fm_modulate(baseband: np.ndarray,
     if peak > 0:
         resampled = resampled / peak
 
-    # Scale to get desired deviation relative to tx_rate
-    # Instantaneous frequency = deviation * m(t)_normalized
-    # Phase = 2π * ∫ f_inst(t) dt
-    # For discrete: phase[k] = phase[k-1] + 2π * deviation * m[k] / tx_rate
+    # Phase accumulation for FM: phase[k] = phase[k-1] + 2*pi*dev*m[k]/tx_rate
     phase_increment = 2.0 * math.pi * deviation / tx_rate
     phase = np.cumsum(resampled * phase_increment)
-
     iq = np.exp(1j * phase).astype(np.complex64)
 
-    # Normalize to [-1.0, 1.0]
+    # Normalize output
     peak = np.max(np.abs(iq))
     if peak > 0:
         iq /= peak
@@ -160,36 +153,32 @@ def transmit_hackrf(iq: np.ndarray,
                     repeat: int = 1):
     """
     Stream IQ samples to hackrf_transfer for transmission.
-
-    Args:
-        iq: Complex64 IQ samples
-        freq_hz: Center frequency in Hz
-        tx_rate: Sample rate in Hz
-        gain_db: TX gain (0-47 dB)
-        repeat: Number of times to repeat the signal
     """
+    if _HACKRF_PATH is None:
+        print("Error: hackrf_transfer not found.")
+        print("Install hackrf-tools or set the path in the script.")
+        sys.exit(1)
+
     # Interleave I/Q as int8 for hackrf_transfer
-    # hackrf_transfer expects interleaved signed 8-bit I/Q samples
     i_scaled = (iq.real * 127).astype(np.int8)
     q_scaled = (iq.imag * 127).astype(np.int8)
     interleaved = np.empty(2 * len(iq), dtype=np.int8)
     interleaved[0::2] = i_scaled
     interleaved[1::2] = q_scaled
 
-    # Repeat if requested
     if repeat > 1:
         interleaved = np.tile(interleaved, repeat)
 
-    # Build hackrf_transfer command
     cmd = [
-        "hackrf_transfer",
-        "-t", "-",            # transmit from stdin
+        _HACKRF_PATH,
+        "-t", "-",
         "-f", str(int(freq_hz)),
         "-s", str(int(tx_rate)),
         "-x", str(gain_db),
-        "-b", "1",            # force baseband filter
+        "-a", "1",
     ]
 
+    print(f"HackRF: {_HACKRF_PATH}")
     print(f"Transmitting at {freq_hz/1e6:.4f} MHz, {tx_rate/1e6:.1f} Msps, gain={gain_db} dB")
     print(f"Signal duration: {len(interleaved) / (2 * tx_rate):.2f}s")
     print("Press Ctrl+C to stop.")
@@ -198,15 +187,18 @@ def transmit_hackrf(iq: np.ndarray,
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-        proc.stdin.write(interleaved.tobytes())
-        proc.stdin.close()
-        proc.wait()
+        stdout, stderr = proc.communicate(input=interleaved.tobytes())
+        if stderr:
+            err_text = stderr.decode(errors="replace")
+            # Filter out expected info messages
+            for line in err_text.splitlines():
+                if "error" in line.lower() or "fail" in line.lower():
+                    print(f"  hackrf: {line.strip()}")
     except FileNotFoundError:
-        print("\nError: hackrf_transfer not found.")
-        print("Install hackrf-tools: https://github.com/greatscottgadgets/hackrf")
+        print(f"\nError: {_HACKRF_PATH} not found.")
         sys.exit(1)
     except KeyboardInterrupt:
         proc.terminate()
