@@ -66,7 +66,8 @@ SPS           = AUDIO_RATE // BIT_RATE  # 10 samples per bit
 TX_RATE       = 2e6          # 2 Msps IQ
 
 # FM deviation - wider = louder on NFM receiver
-FM_DEVIATION  = 4000.0       # Hz peak deviation
+# Keep low (2 kHz) so signal fits within 12.5 kHz IF filter
+FM_DEVIATION  = 2000.0       # Hz peak deviation
 
 # Default Orbcomm downlink frequencies (MHz)
 ORBCOMM_FREQS = [
